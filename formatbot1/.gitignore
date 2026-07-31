@@ -54,3 +54,9 @@ count.txt
 .now
 src/tests/*
 tmp/
+
+
+# Added by cargo
+
+/target
+Cargo.lock
