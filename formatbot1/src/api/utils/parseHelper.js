@@ -102,7 +102,7 @@ class ParseHelper {
     logger(`this.params.isPuppet ${this.params.isPuppet}`);
     if (this.params.isPuppet) {
       content = await puppet(link, this.params);
-      logger('pup html 0 is ' + content.length);
+      // logger('pup html 0 is ' + content.length);
       this.log(content, 'puppet.html');
     } else {
       try {
@@ -176,9 +176,10 @@ class ParseHelper {
       result.content = `${fs.readFileSync(`.conf/${cacheFile}`)}`;
     } else {
       result = await htmlParser(userUrl, opts);
-      this.log(result.content, 'parsed.html');
+      if (result && typeof result === 'object') this.log(result.content, 'parsed.html');
     }
-    let {content} = result;
+
+    let {content} = result || {};
     this.log(content, 'before_content.html');
 
     let preContent = sanitizeHtml(content);
@@ -190,18 +191,18 @@ class ParseHelper {
       const html = await this.puppet(userUrl);
       if (html) {
         result = await htmlParser(userUrl, {html: Buffer.from(html)});
-        this.log(result.content, 'parsedAsyncContent.html');
+        if (result && typeof result === 'object') this.log(result.content, 'parsedAsyncContent.html');
       }
     }
-    const {url: source, iframe} = result;
+    const {url: source, iframe} = result || {};
 
-    let {title = ''} = result;
+    let {title = ''} = result || {};
     if (iframe) {
       this.log(iframe, 'iframes.html');
     }
     if (this.title) title = this.title;
 
-    content = result.content;
+    if (result) content = result.content;
     const data = await race([
       this.fixHtml(content, iframe),
       timeout(7)
