@@ -1,0 +1,205 @@
+//! ICU word boundary segmentation.
+//!
+//! Wraps ICU's `UBreakIterator` to segment text into words, filtering out
+//! whitespace and punctuation segments. Returns byte offset spans in UTF-8.
+
+use std::cell::RefCell;
+
+use rust_icu_ubrk::UBreakIterator;
+
+/// Default breaking rules, copied from Lucene's ICU integration.
+const DEFAULT_RULES: &str = include_str!("../Default.rbbi");
+
+thread_local! {
+    /// Cached prototype break iterator. Compiling the RBBI rules is expensive
+    /// (~7ms), but `safe_clone()` + `set_text()` is <1µs.
+    static BREAK_ITER_PROTOTYPE: RefCell<UBreakIterator> = RefCell::new(
+        UBreakIterator::try_new_rules(DEFAULT_RULES, " ")
+            .expect("ICU break iterator init failed")
+    );
+}
+
+/// A character is "searchable" if it's not just whitespace or punctuation.
+fn is_searchable_char(c: char) -> bool {
+    if c.is_alphanumeric() {
+        return true;
+    }
+    if c.is_whitespace() || c.is_ascii_punctuation() || c.is_control() {
+        return false;
+    }
+    if is_unicode_punctuation(c) {
+        return false;
+    }
+    // Everything else above ASCII is searchable: emoji, symbols, CJK radicals, etc.
+    c as u32 > 0x7F
+}
+
+fn is_unicode_punctuation(c: char) -> bool {
+    matches!(c,
+        // General Punctuation
+        '\u{2010}'..='\u{2027}' | '\u{2030}'..='\u{205E}'
+        // CJK Symbols and Punctuation
+        | '\u{3000}'..='\u{3003}' | '\u{3008}'..='\u{3011}' | '\u{3014}'..='\u{301F}'
+        // CJK Compatibility Forms
+        | '\u{FE30}'..='\u{FE4F}'
+        // Small Form Variants
+        | '\u{FE50}'..='\u{FE6B}'
+        // Fullwidth punctuation (mapped from ASCII)
+        | '\u{FF01}'..='\u{FF0F}' | '\u{FF1A}'..='\u{FF20}'
+        | '\u{FF3B}'..='\u{FF3D}' | '\u{FF5B}'..='\u{FF65}'
+        // Miscellaneous individual punctuation chars
+        | '\u{00A1}' | '\u{00A7}' | '\u{00AB}' | '\u{00B6}' | '\u{00B7}' | '\u{00BB}' | '\u{00BF}'
+    )
+}
+
+/// Segments `text` into words using ICU's rule-based break iterator.
+///
+/// Returns a list of `(start_byte, end_byte)` spans for each word segment,
+/// filtering out whitespace-only and punctuation-only segments.
+pub fn icu_word_break(text: &str) -> Vec<(usize, usize)> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+
+    // Build UTF-16 code unit index → UTF-8 byte offset mapping.
+    let mut utf16_to_byte = Vec::new();
+    let mut byte_offset = 0;
+    for ch in text.chars() {
+        for _ in 0..ch.len_utf16() {
+            utf16_to_byte.push(byte_offset);
+        }
+        byte_offset += ch.len_utf8();
+    }
+    utf16_to_byte.push(byte_offset); // sentinel
+
+    let utf16_to_byte_offset = |utf16_pos: i32| -> usize {
+        let pos = utf16_pos as usize;
+        if pos < utf16_to_byte.len() {
+            utf16_to_byte[pos]
+        } else {
+            text.len()
+        }
+    };
+
+    let mut break_iter = BREAK_ITER_PROTOTYPE.with(|proto| {
+        let mut iter = proto
+            .borrow()
+            .safe_clone()
+            .expect("ICU break iterator clone failed");
+        iter.set_text(text)
+            .expect("ICU break iterator set_text failed");
+        iter
+    });
+
+    let mut spans = Vec::new();
+
+    loop {
+        let start_utf16 = break_iter.current();
+        let end_utf16 = match break_iter.next() {
+            Some(e) => e,
+            None => break,
+        };
+
+        let start_byte = utf16_to_byte_offset(start_utf16);
+        let end_byte = utf16_to_byte_offset(end_utf16);
+        let word = &text[start_byte..end_byte];
+
+        if word.chars().any(is_searchable_char) {
+            spans.push((start_byte, end_byte));
+        }
+    }
+
+    spans
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn break_texts(text: &str) -> Vec<&str> {
+        icu_word_break(text)
+            .iter()
+            .map(|&(s, e)| &text[s..e])
+            .collect()
+    }
+
+    #[test]
+    fn word_break_latin() {
+        assert_eq!(break_texts("hello world"), &["hello", "world"]);
+    }
+
+    #[test]
+    fn word_break_cjk_mixed() {
+        let tokens = break_texts("hello你好world");
+        assert!(tokens.contains(&"hello"));
+        assert!(tokens.contains(&"world"));
+    }
+
+    #[test]
+    fn word_break_supplementary_plane() {
+        let text = "𠮷野家";
+        let spans = icu_word_break(text);
+        for (s, e) in spans {
+            assert!(text.is_char_boundary(s));
+            assert!(text.is_char_boundary(e));
+        }
+    }
+
+    #[test]
+    fn word_break_empty() {
+        assert!(icu_word_break("").is_empty());
+    }
+
+    #[test]
+    fn word_break_whitespace_only() {
+        assert!(icu_word_break("   \t\n  ").is_empty());
+    }
+
+    #[test]
+    fn word_break_punctuation_only() {
+        assert!(icu_word_break("!!!???").is_empty());
+    }
+
+    #[test]
+    fn word_break_thai_dictionary() {
+        // Thai has no spaces between words; ICU's dictionary engine
+        // (thaidict) is engaged via $ComplexContext in the RBBI rules.
+        assert_eq!(break_texts("ภาษาไทย"), &["ภาษา", "ไทย"]);
+        assert_eq!(break_texts("สวัสดีครับ"), &["สวัสดี", "ครับ"]);
+        assert_eq!(break_texts("ขอบคุณมาก"), &["ขอบคุณ", "มาก"]);
+    }
+
+    #[test]
+    fn word_break_khmer_dictionary() {
+        assert_eq!(break_texts("ខ្ញុំស្រលាញ់ភាសាខ្មែរ"), &["ខ្ញុំ", "ស្រលាញ់", "ភាសាខ្មែរ"]);
+    }
+
+    #[test]
+    fn word_break_lao_dictionary() {
+        assert_eq!(break_texts("ສະບາຍດີຊາວໂລກ"), &["ສະບາຍດີ", "ຊາວໂລກ"]);
+    }
+
+    #[test]
+    fn word_break_burmese_dictionary() {
+        assert_eq!(break_texts("မင်္ဂလာပါ"), &["မင်္ဂလာ", "ပါ"]);
+    }
+
+    #[test]
+    fn word_break_mixed_thai_cjk_latin() {
+        // CJK already splits per-char at the RBBI level (dictionary break disabled).
+        assert_eq!(
+            break_texts("Hello สวัสดี 你好 world"),
+            &["Hello", "สวัสดี", "你", "好", "world"]
+        );
+    }
+
+    #[test]
+    fn word_break_emoji() {
+        let text = "hello🎉world";
+        let tokens = break_texts(text);
+        assert!(tokens.contains(&"hello"));
+        assert!(tokens.contains(&"world"));
+        // Emoji should also be a token.
+        assert!(tokens.contains(&"🎉"));
+    }
+}
